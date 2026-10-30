@@ -214,6 +214,45 @@ def _pdf_settings_combo() -> QComboBox:
     return combo
 
 
+class WatermarkTextField(QWidget):
+    """Watermark text box with a button that restores the default text."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._edit = QLineEdit(core.WATERMARK_TEXT)
+        self._edit.setToolTip("Text of the watermark.")
+        layout.addWidget(self._edit, stretch=1)
+        reset = QPushButton("Default")
+        reset.setToolTip(f"Reset to: {core.WATERMARK_TEXT}")
+        reset.clicked.connect(lambda: self._edit.setText(core.WATERMARK_TEXT))
+        layout.addWidget(reset)
+
+    def text(self) -> str:
+        return self._edit.text()
+
+    def setText(self, text: str) -> None:
+        self._edit.setText(text)
+
+
+# Remembered setting widgets: how to read and write each kind.
+_ACCESSORS = {
+    QCheckBox: (QCheckBox.isChecked, QCheckBox.setChecked),
+    QComboBox: (QComboBox.currentText, QComboBox.setCurrentText),
+    QDoubleSpinBox: (QDoubleSpinBox.value, QDoubleSpinBox.setValue),
+    QLineEdit: (QLineEdit.text, QLineEdit.setText),
+    WatermarkTextField: (WatermarkTextField.text, WatermarkTextField.setText),
+}
+
+
+def _accessors(widget: QWidget):
+    for cls, pair in _ACCESSORS.items():
+        if isinstance(widget, cls):
+            return pair
+    raise TypeError(f"Cannot remember a {type(widget).__name__}")
+
+
 ELLIPSIS = "…"
 
 
@@ -295,6 +334,9 @@ class OperationDialog(QDialog):
         self.setWindowTitle(f"{self.title} - {APP_NAME}")
         self.setMinimumWidth(520)
 
+        # (settings key, widget, default value) for every remembered setting
+        self._remembered: list[tuple[str, QWidget, object]] = []
+
         layout = QVBoxLayout(self)
 
         heading = QLabel(self.title)
@@ -333,12 +375,17 @@ class OperationDialog(QDialog):
         buttons = QDialogButtonBox()
         self.start_button = buttons.addButton("Start", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        if self._remembered:
+            restore = buttons.addButton(QDialogButtonBox.StandardButton.RestoreDefaults)
+            restore.setToolTip("Put every setting back to its default (saved when you press Start).")
+            restore.clicked.connect(self.restore_defaults)
         self.start_button.setDefault(True)
         self.start_button.setEnabled(not missing)
         buttons.accepted.connect(self._on_start)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._load_settings()
         self.refresh_outputs()
 
     # -- hooks -----------------------------------------------------------
@@ -361,6 +408,42 @@ class OperationDialog(QDialog):
     def job(self) -> Job:
         raise NotImplementedError
 
+    # -- remembered settings ---------------------------------------------
+
+    def remember(self, key: str, widget: QWidget) -> QWidget:
+        """Remember widget's value under key; its current value is the default.
+
+        Call from add_settings after setting the widget's default. Stored values
+        are applied once the dialog is built and saved when Start is pressed.
+        """
+        getter, _ = _accessors(widget)
+        self._remembered.append((key, widget, getter(widget)))
+        return widget
+
+    def _load_settings(self) -> None:
+        settings = QSettings()
+        for key, widget, default in self._remembered:
+            if settings.contains(key):
+                _, setter = _accessors(widget)
+                setter(widget, settings.value(key, default, type=type(default)))
+
+    def save_settings(self) -> None:
+        # Defaults are not stored, so a default that changes (e.g. the year in the
+        # watermark text) keeps tracking the code instead of being frozen.
+        settings = QSettings()
+        for key, widget, default in self._remembered:
+            getter, _ = _accessors(widget)
+            value = getter(widget)
+            if value == default:
+                settings.remove(key)
+            else:
+                settings.setValue(key, value)
+
+    def restore_defaults(self) -> None:
+        for _, widget, default in self._remembered:
+            _, setter = _accessors(widget)
+            setter(widget, default)
+
     # -- internals -------------------------------------------------------
 
     def refresh_outputs(self) -> None:
@@ -381,6 +464,7 @@ class OperationDialog(QDialog):
         if error:
             QMessageBox.warning(self, self.title, error)
             return
+        self.save_settings()
         self.accept()
 
 
@@ -442,10 +526,9 @@ class PostNotesDialog(OperationDialog):
     required_tools = (("libreoffice", "soffice"), ("gs",))
 
     def add_settings(self, form: QFormLayout) -> None:
-        self.text_edit = QLineEdit(core.WATERMARK_TEXT)
-        self.text_edit.setToolTip("Text of the watermark.")
+        self.text_edit = self.remember("watermark/text", WatermarkTextField())
         form.addRow("Watermark text:", self.text_edit)
-        self.settings_combo = _pdf_settings_combo()
+        self.settings_combo = self.remember("pdf/settings", _pdf_settings_combo())
         form.addRow("PDF settings:", self.settings_combo)
 
     def outputs(self) -> list[Path]:
@@ -477,12 +560,13 @@ class CompressDialog(OperationDialog):
     required_tools = (("gs",),)
 
     def add_settings(self, form: QFormLayout) -> None:
-        self.settings_combo = _pdf_settings_combo()
+        self.settings_combo = self.remember("pdf/settings", _pdf_settings_combo())
         form.addRow("PDF settings:", self.settings_combo)
         self.replace_check = QCheckBox("Replace the original file")
         self.replace_check.setChecked(True)
         self.replace_check.setToolTip("Unchecked: write <name>_compressed.pdf next to the original instead.")
         self.replace_check.toggled.connect(self.refresh_outputs)
+        # Not remembered: choices about overwriting files are made fresh every time.
         form.addRow("", self.replace_check)
 
     def _output(self) -> Path:
@@ -510,7 +594,7 @@ class WatermarkDialog(OperationDialog):
     )
 
     def add_settings(self, form: QFormLayout) -> None:
-        self.text_edit = QLineEdit(core.WATERMARK_TEXT)
+        self.text_edit = self.remember("watermark/text", WatermarkTextField())
         form.addRow("Text:", self.text_edit)
 
         angle_row = QHBoxLayout()
@@ -553,6 +637,15 @@ class WatermarkDialog(OperationDialog):
         self.seed_edit.setToolTip("Integer random seed for jitter, to reproduce a run. Leave blank for random.")
         self.jitter_check.toggled.connect(self.seed_edit.setEnabled)
         form.addRow("Seed:", self.seed_edit)
+
+        self.remember("watermark/auto_angle", self.auto_angle)
+        self.remember("watermark/angle", self.angle_spin)
+        self.remember("watermark/gray", self.gray_spin)
+        self.remember("watermark/opacity", self.alpha_spin)
+        self.remember("watermark/layer", self.layer_combo)
+        self.remember("watermark/tile_opacity", self.tile_spin)
+        self.remember("watermark/jitter", self.jitter_check)
+        self.remember("watermark/seed", self.seed_edit)
 
     def outputs(self) -> list[Path]:
         return list(core.watermark_outputs(self.path.with_suffix("")))
@@ -598,11 +691,15 @@ WATERMARK_OP: Operation = ("Watermark", "Add reader and raster watermarked copie
 
 
 def operations_for(path: Path) -> tuple[str, list[Operation]]:
-    """A heading and the operations available for path."""
+    """A heading and the operations available for path.
+
+    Buttons are laid out two per row; with an odd number, the last one gets a
+    full-width row of its own, so list the operation to highlight last.
+    """
     if path.suffix.lower() == ".pdf":
         return "PDF document", [COMPRESS_OP, WATERMARK_OP]
     if is_notes_file(path):
-        return "Notes presentation (_notes)", [PDF_OP, POST_NOTES_OP, STANDARDIZE_OP]
+        return "Notes presentation (_notes)", [PDF_OP, STANDARDIZE_OP, POST_NOTES_OP]
     return "PowerPoint presentation", [PDF_OP, PWC_OP, PRE_NOTES_OP, STANDARDIZE_OP]
 
 
@@ -791,7 +888,10 @@ class MainWindow(QMainWindow):
             button.setMinimumHeight(36)
             button.setEnabled(self.worker is None)
             button.clicked.connect(lambda _=False, cls=dialog_cls: self._open_operation(cls))
-            self.functions_grid.addWidget(button, i // 2, i % 2)
+            if i == len(ops) - 1 and len(ops) % 2:
+                self.functions_grid.addWidget(button, i // 2, 0, 1, 2)  # last of an odd number: full row
+            else:
+                self.functions_grid.addWidget(button, i // 2, i % 2)
 
     # -- file selection --------------------------------------------------
 
